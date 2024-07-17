@@ -4,9 +4,14 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net/http"
+	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -16,12 +21,35 @@ import (
 )
 
 const (
-	CacheKeyContextKey       = "cacheKey"
+	// 缓存单次content的key
+	CacheKeyContextKey = "cacheKey"
+	// 缓存单次content的prompt
+	CachePromptContextKey = "cachePrompt"
+
 	CacheContentContextKey   = "cacheContent"
 	PartialMessageContextKey = "partialMessage"
 	ToolCallsContextKey      = "toolCalls"
 	StreamContextKey         = "stream"
 	DefaultCacheKeyPrefix    = "higress-ai-cache:"
+
+	// 缓存累积content的key
+	CacheFullKeyContextKey = "cacheFullKey"
+	// 缓存累积content的prompt
+	CacheFullPromptContextKey = "cacheFullPrompt"
+
+	EmbeddingUrl       = "/api/v1/services/embeddings/text-embedding/text-embedding"
+	VectorSearchUrlTpl = "/v1/collections/%s/query"
+	VectorInsertUrlTpl = "/v1/collections/%s/docs"
+
+	VectorSingleMinCosine     float64 = 0.1
+	VectorFullMinCosine       float64 = 0.2
+	VectorFullSingleMinCosine float64 = 0.2
+
+	CacheAllItemKey               = "cacheAllItem"
+	CacheCurrentFullPromptItemKey = "CacheCurrentFullPromptItemKey"
+	CacheCurrentLastPromptItemKey = "CacheCurrentLastPromptItemKey"
+
+	MaxCacheItems = 100
 )
 
 func main() {
@@ -31,41 +59,10 @@ func main() {
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
 		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
-		wrapper.ProcessStreamingResponseBodyBy(onHttpResponseBody),
+		wrapper.ProcessStreamingResponseBodyBy(onStreamingResponseBody),
+		// wrapper.ProcessResponseBodyBy(onHttpResponseBody),
 	)
 }
-
-// @Name ai-cache
-// @Category protocol
-// @Phase AUTHN
-// @Priority 10
-// @Title zh-CN AI Cache
-// @Description zh-CN 大模型结果缓存
-// @IconUrl
-// @Version 0.1.0
-//
-// @Contact.name johnlanni
-// @Contact.url
-// @Contact.email
-//
-// @Example
-// redis:
-//   serviceName: my-redis.dns
-//   timeout: 2000
-// cacheKeyFrom:
-//   requestBody: "messages.@reverse.0.content"
-// cacheValueFrom:
-//   responseBody: "choices.0.message.content"
-// cacheStreamValueFrom:
-//   responseBody: "choices.0.delta.content"
-// returnResponseTemplate: |
-//   {"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"gpt-4o","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}
-// returnStreamResponseTemplate: |
-//   data:{"id":"from-cache","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"gpt-4o","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}
-//
-//   data:[DONE]
-//
-// @End
 
 type RedisInfo struct {
 	// @Title zh-CN redis 服务名称
@@ -118,9 +115,26 @@ type PluginConfig struct {
 	// @Description zh-CN 默认值是"higress-ai-cache:"
 	CacheKeyPrefix string              `required:"false" yaml:"cacheKeyPrefix" json:"cacheKeyPrefix"`
 	redisClient    wrapper.RedisClient `yaml:"-" json:"-"`
+
+	// embedding server info
+	EmbeddingServiceName string             `yaml:"embeddingServiceName"`
+	EmbeddingServicePort int64              `yaml:"embeddingServicePort"`
+	EmbeddingServiceKey  string             `yaml:"embeddingServiceKey"`
+	embeddingClient      wrapper.HttpClient `yaml:"-" json:"-"`
+
+	// Vector server info
+	VectorServiceName       string             `yaml:"vectorServiceName"`
+	VectorServicePort       int64              `yaml:"vectorServicePort"`
+	VectorServiceCollection string             `yaml:"vectorServiceCollection"`
+	VectorServiceKey        string             `yaml:"vectorServiceKey"`
+	vectorClient            wrapper.HttpClient `yaml:"-" json:"-"`
+
+	VectorSingleMinCosine float64 `yaml:"vectorSingleMinCosine" json:"vectorSingleMinCosine"`
+	VectorFullMinCosine   float64 `yaml:"vectorFullMinCosine" json:"vectorFullMinCosine"`
 }
 
 func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
+	log.Info("start ai-cache parse config")
 	c.RedisInfo.ServiceName = json.Get("redis.serviceName").String()
 	if c.RedisInfo.ServiceName == "" {
 		return errors.New("redis service name must not by empty")
@@ -154,11 +168,11 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 	}
 	c.ReturnResponseTemplate = json.Get("returnResponseTemplate").String()
 	if c.ReturnResponseTemplate == "" {
-		c.ReturnResponseTemplate = `{"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"gpt-4o","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+		c.ReturnResponseTemplate = `{"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"qwen-long","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
 	}
 	c.ReturnStreamResponseTemplate = json.Get("returnStreamResponseTemplate").String()
 	if c.ReturnStreamResponseTemplate == "" {
-		c.ReturnStreamResponseTemplate = `data:{"id":"from-cache","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"gpt-4o","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}` + "\n\ndata:[DONE]\n\n"
+		c.ReturnStreamResponseTemplate = `data:{"id":"from-cache","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"qwen-long","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}` + "\n\ndata:[DONE]\n\n"
 	}
 	c.CacheKeyPrefix = json.Get("cacheKeyPrefix").String()
 	if c.CacheKeyPrefix == "" {
@@ -168,6 +182,27 @@ func parseConfig(json gjson.Result, c *PluginConfig, log wrapper.Log) error {
 		FQDN: c.RedisInfo.ServiceName,
 		Port: int64(c.RedisInfo.ServicePort),
 	})
+
+	c.EmbeddingServiceName = json.Get("embeddingServiceName").String()
+	c.EmbeddingServicePort = json.Get("embeddingServicePort").Int()
+	c.EmbeddingServiceKey = json.Get("embeddingServiceKey").String()
+	c.embeddingClient = wrapper.NewClusterClient(wrapper.DnsCluster{
+		ServiceName: c.EmbeddingServiceName,
+		Domain:      "dashscope.aliyuncs.com",
+		Port:        int64(c.EmbeddingServicePort),
+	})
+	c.VectorServiceName = json.Get("vectorServiceName").String()
+	c.VectorServicePort = json.Get("vectorServicePort").Int()
+	c.VectorServiceKey = json.Get("vectorServiceKey").String()
+	c.VectorServiceCollection = json.Get("vectorServiceCollection").String()
+	c.vectorClient = wrapper.NewClusterClient(wrapper.DnsCluster{
+		ServiceName: c.VectorServiceName,
+		Domain:      "vrs-cn-k963t7lcd0001i.dashvector.cn-hangzhou.aliyuncs.com",
+		Port:        int64(c.VectorServicePort),
+	})
+	c.VectorSingleMinCosine = json.Get("vectorSingleMinCosine").Float()
+	c.VectorFullMinCosine = json.Get("vectorFullMinCosine").Float()
+
 	return c.redisClient.Init(c.RedisInfo.Username, c.RedisInfo.Password, int64(c.RedisInfo.Timeout))
 }
 
@@ -192,7 +227,96 @@ func TrimQuote(source string) string {
 	return strings.Trim(source, `"`)
 }
 
+type QwenInput struct {
+	Model            string        `json:"model"`
+	FrequencyPenalty int           `json:"frequency_penalty"`
+	MaxTokens        int           `json:"max_tokens"`
+	Stream           bool          `json:"stream"`
+	Messages         []QwenMessage `json:"messages"`
+	PresencePenalty  float32       `json:"presence_penalty"`
+	Temperature      float32       `json:"temperature"`
+	TopP             float32       `json:"top_p"`
+}
+
+type QwenMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// isSingleMessage 判断消息是否只有一个用户提问
+func isSingleMessage(messages []QwenMessage) bool {
+	userCount := 0
+	for _, message := range messages {
+		if message.Role == "user" {
+			userCount++
+		}
+		if userCount > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// 自定义的标点符号集合
+var punctuation = []rune{'?', '？', ' '}
+
+// isPunctOrSpace 判断字符是否是标点符号或空格
+func isPunctOrSpace(r rune) bool {
+	// 检查字符是否是空格
+	if unicode.IsSpace(r) {
+		return true
+	}
+	// 检查字符是否在标点符号集合中
+	for _, p := range punctuation {
+		if r == p {
+			return true
+		}
+	}
+	return false
+}
+
+// trimRightPunctAndSpace 去除字符串末尾的标点符号和空格
+func trimRightPunctAndSpace(s string) string {
+	return strings.TrimRightFunc(s, isPunctOrSpace)
+}
+
+type CacheItem struct {
+	FullPrompt       string    `json:"full_prompt"`
+	LastPrompt       string    `json:"last_prompt"`
+	Content          string    `json:"content"`
+	FullPromptVector []float64 `json:"full_prompt_vector"`
+	LastPromptVector []float64 `json:"last_prompt_vector"`
+}
+
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log wrapper.Log) types.Action {
+	log.Infof("[onHttpRequestBody] get body: '%s'", string(body))
+	input := new(QwenInput)
+	if err := json.Unmarshal(body, input); err != nil {
+		log.Errorf("[onHttpRequestBody] Failed to unmarshal input, err:%v", err)
+		return types.ActionContinue
+	}
+	messageLength := len(input.Messages)
+	// 单次content
+	lastPrompt := input.Messages[messageLength-1].Content
+	lastPrompt = TrimQuote(lastPrompt)
+	log.Infof("[onHttpRequestBody] lastPrompt: '%s'", lastPrompt)
+	// 累积content
+	fullPrompt := ""
+	// user message最多取两个
+	messageSlice := input.Messages[:]
+	if messageLength >= 4 {
+		messageSlice = input.Messages[messageLength-4:]
+	}
+	for _, message := range messageSlice {
+		if message.Role == "user" {
+			content := TrimQuote(message.Content)
+			fullPrompt += content + "||"
+		}
+	}
+	fullPrompt = TrimQuote(fullPrompt)
+	fullPrompt = strings.TrimSuffix(fullPrompt, "||")
+	log.Infof("[onHttpRequestBody] fullPrompt: '%s'", fullPrompt)
+
 	bodyJson := gjson.ParseBytes(body)
 	// TODO: It may be necessary to support stream mode determination for different LLM providers.
 	stream := false
@@ -202,36 +326,541 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	} else if ctx.GetContext(StreamContextKey) != nil {
 		stream = true
 	}
-	key := TrimQuote(bodyJson.Get(config.CacheKeyFrom.RequestBody).Raw)
-	if key == "" {
-		log.Debug("parse key from request body failed")
-		return types.ActionContinue
-	}
-	ctx.SetContext(CacheKeyContextKey, key)
-	err := config.redisClient.Get(config.CacheKeyPrefix+key, func(response resp.Value) {
-		if err := response.Error(); err != nil {
-			log.Errorf("redis get key:%s failed, err:%v", key, err)
-			proxywasm.ResumeHttpRequest()
-			return
-		}
-		if response.IsNull() {
-			log.Debugf("cache miss, key:%s", key)
-			proxywasm.ResumeHttpRequest()
-			return
-		}
-		log.Debugf("cache hit, key:%s", key)
-		ctx.SetContext(CacheKeyContextKey, nil)
-		if !stream {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnResponseTemplate, response.String())), -1)
-		} else {
-			proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(config.ReturnStreamResponseTemplate, response.String())), -1)
-		}
-	})
+
+	embeddingRequestBody, embeddingHeaders, err := generateEmbeddingRequest(&config, []string{fullPrompt, lastPrompt}, log)
 	if err != nil {
-		log.Error("redis access failed")
+		log.Error(err.Error())
 		return types.ActionContinue
 	}
+	err = config.embeddingClient.Post(EmbeddingUrl, embeddingHeaders, embeddingRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+		if statusCode != 200 {
+			log.Errorf("[onHttpRequestBody] Failed to fetch embeddings, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+			proxywasm.ResumeHttpRequest()
+			return
+		}
+
+		log.Debugf("[onHttpRequestBody] Successfully fetched embeddings for fullPrompt: '%s'", fullPrompt)
+		embeddingResult := new(EmbeddingResponse)
+		if err := json.Unmarshal(responseBody, embeddingResult); err != nil {
+			log.Errorf("[onHttpRequestBody] Failed to unmarshal embedding result, err:%v", err)
+			proxywasm.ResumeHttpRequest()
+			return
+		}
+
+		fullPromptVector := embeddingResult.Output.Embeddings[0].Embedding
+		lastPromptVector := embeddingResult.Output.Embeddings[1].Embedding
+
+		currentCacheFullPromptItem := CacheItem{
+			FullPrompt:       fullPrompt,
+			LastPrompt:       lastPrompt,
+			FullPromptVector: fullPromptVector,
+			LastPromptVector: lastPromptVector,
+		}
+		currentCacheLastPromptItem := CacheItem{
+			FullPrompt:       lastPrompt,
+			LastPrompt:       lastPrompt,
+			FullPromptVector: lastPromptVector,
+			LastPromptVector: lastPromptVector,
+		}
+
+		err := config.redisClient.Get(CacheAllItemKey, func(response resp.Value) {
+			log.Info("[onHttpRequestBody] redis callback")
+			if err := response.Error(); err != nil {
+				log.Errorf("[onHttpRequestBody] redis get key:%s failed, err:%v", CacheAllItemKey, err)
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+			cacheAllItemValue := response.String()
+			allItem := make([]CacheItem, 0)
+			if !response.IsNull() {
+				if err := json.Unmarshal([]byte(cacheAllItemValue), &allItem); err != nil {
+					log.Errorf("[onHttpRequestBody] unmarshal cache item failed, err:%v", err)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+			}
+			log.Infof("[onHttpRequestBody] allItem from redis: '%d'", len(allItem))
+
+			ctx.SetContext(CacheAllItemKey, allItem)
+			ctx.SetContext(CacheCurrentFullPromptItemKey, currentCacheFullPromptItem)
+			ctx.SetContext(CacheCurrentLastPromptItemKey, currentCacheLastPromptItem)
+
+			// 查询相似向量
+			searchResult := searchFullPromptVector(fullPromptVector, allItem, VectorFullMinCosine, log)
+			if len(searchResult) == 0 {
+				log.Infof("[onHttpRequestBody] there is no vector search output from server")
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+			for _, r := range searchResult {
+				log.Infof("[onHttpRequestBody] fullPrompt vector search result: '%s', lastPrompt: '%s'", r.FullPrompt, r.LastPrompt)
+			}
+
+			var minDc float64 = 2
+			var minDcItem CacheItem
+			for _, item := range searchResult {
+				dc := distCosine(lastPromptVector, item.LastPromptVector)
+				log.Infof("[onHttpRequestBody] lastPrompt '%s', item.LastPrompt '%s', dc: %f", lastPrompt, item.LastPrompt, dc)
+				if dc < minDc {
+					minDc = dc
+					minDcItem = item.CacheItem
+				}
+			}
+			log.Infof("[onHttpRequestBody] minDc: '%f'", minDc)
+			if minDc < VectorFullSingleMinCosine {
+				log.Infof("[onHttpRequestBody] cache hit: fullPrompt: '%s'", minDcItem.FullPrompt)
+				currentCacheFullPromptItem.Content = minDcItem.Content
+				currentCacheLastPromptItem.Content = minDcItem.Content
+				allItem = append(allItem, currentCacheFullPromptItem)
+				if !(currentCacheFullPromptItem.FullPrompt == currentCacheLastPromptItem.FullPrompt && currentCacheFullPromptItem.LastPrompt == currentCacheLastPromptItem.LastPrompt) {
+					allItem = append(allItem, currentCacheLastPromptItem)
+				}
+				// 只保留 100
+				if len(allItem) > MaxCacheItems {
+					allItem = allItem[len(allItem)-MaxCacheItems:]
+				}
+				bytes, _ := json.Marshal(allItem)
+				config.redisClient.Set(CacheAllItemKey, string(bytes), nil)
+				if config.CacheTTL != 0 {
+					config.redisClient.Expire(CacheAllItemKey, config.CacheTTL, nil)
+				}
+
+				ctx.SetContext(CacheAllItemKey, nil)
+				ctx.SetContext(CacheCurrentFullPromptItemKey, nil)
+				ctx.SetContext(CacheCurrentLastPromptItemKey, nil)
+
+				log.Infof("[onHttpRequestBody] fullPrompt vector search hit")
+				respBody := fmt.Sprintf(config.ReturnResponseTemplate, minDcItem.Content)
+				if !stream {
+					log.Debugf("[onHttpRequestBody] return response: '%s'", respBody)
+					proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(respBody), -1)
+					return
+				} else {
+					log.Debugf("[onHttpRequestBody] return response: '%s'", respBody)
+					proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(respBody), -1)
+					return
+				}
+			} else {
+				log.Info("[onHttpRequestBody] vector not hit")
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+		})
+		if err != nil {
+			log.Error("redis access failed")
+			proxywasm.ResumeHttpRequest()
+			return
+		}
+	}, 10000)
+	if err != nil {
+		log.Error(err.Error())
+		return types.ActionContinue
+	}
+
 	return types.ActionPause
+}
+
+type VectorCacheItem struct {
+	CacheItem
+	DistCosine float64
+}
+
+func searchFullPromptVector(fullPromptVector []float64, allItem []CacheItem, threshold float64, log wrapper.Log) []VectorCacheItem {
+	result := make([]VectorCacheItem, 0)
+	for _, item := range allItem {
+		dc := distCosine(fullPromptVector, item.FullPromptVector)
+		if dc < threshold {
+			result = append(result, VectorCacheItem{item, dc})
+		}
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].DistCosine < result[j].DistCosine
+	})
+
+	if len(result) > 3 {
+		return result[:3]
+	}
+	return result
+}
+
+func onHttpRequestBody3(ctx wrapper.HttpContext, config PluginConfig, body []byte, log wrapper.Log) types.Action {
+
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Recovered in f, r=%v\n", r)
+		}
+	}()
+
+	log.Infof("[onHttpRequestBody] get body: '%s'", string(body))
+	input := new(QwenInput)
+	if err := json.Unmarshal(body, input); err != nil {
+		log.Errorf("[onHttpRequestBody] Failed to unmarshal input, err:%v", err)
+		return types.ActionContinue
+	}
+	messageLength := len(input.Messages)
+	// 单次content
+	singleContent := input.Messages[messageLength-1].Content
+	singleContent = TrimQuote(singleContent)
+	// singleContent = trimRightPunctAndSpace(singleContent)
+
+	// 累积content
+	fullContent := ""
+	// user message最多取两个
+	messageSlice := input.Messages[:]
+	if messageLength >= 4 {
+		messageSlice = input.Messages[messageLength-4:]
+	}
+	for _, message := range messageSlice {
+		if message.Role == "user" {
+			content := TrimQuote(message.Content)
+			fullContent += content + "||"
+		}
+	}
+	fullContent = TrimQuote(fullContent)
+	fullContent = strings.TrimSuffix(fullContent, "||")
+
+	isSingle := isSingleMessage(input.Messages)
+
+	bodyJson := gjson.ParseBytes(body)
+	// TODO: It may be necessary to support stream mode determination for different LLM providers.
+	stream := false
+	if bodyJson.Get("stream").Bool() {
+		stream = true
+		ctx.SetContext(StreamContextKey, struct{}{})
+	} else if ctx.GetContext(StreamContextKey) != nil {
+		stream = true
+	}
+	log.Infof("[onHttpRequestBody] fullContent is '%s'", fullContent)
+	if fullContent == "" {
+		log.Debug("[onHttpRequestBody] parse key from request body failed")
+		return types.ActionContinue
+	}
+
+	embeddingRequestBody, embeddingHeaders, err := generateEmbeddingRequest(&config, []string{fullContent}, log)
+	if err != nil {
+		log.Error(err.Error())
+		return types.ActionContinue
+	}
+
+	// 分情况讨论：这次请求只有一个用户提问/这次请求有多个历史提问
+	// 计算累积content向量
+	if !isSingle {
+		err = config.embeddingClient.Post(EmbeddingUrl, embeddingHeaders, embeddingRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != 200 {
+				log.Errorf("[onHttpRequestBody] Failed to fetch embeddings, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+
+			log.Debugf("[onHttpRequestBody] Successfully fetched embeddings for fullContent: '%s'", fullContent)
+			embeddingResult := new(EmbeddingResponse)
+			if err := json.Unmarshal(responseBody, embeddingResult); err != nil {
+				log.Errorf("[onHttpRequestBody] Failed to unmarshal embedding result, err:%v", err)
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+			ctx.SetContext(CacheFullPromptContextKey, fullContent)
+			ctx.SetContext(CacheFullKeyContextKey, embeddingResult.Output.Embeddings[0].Embedding)
+
+			// 计算单次content向量
+			singleEmbeddingRequestBody, singleEmbeddingHeaders, err := generateEmbeddingRequest(&config, []string{singleContent}, log)
+			if err != nil {
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+			err = config.embeddingClient.Post(EmbeddingUrl, singleEmbeddingHeaders, singleEmbeddingRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+				if statusCode != 200 {
+					log.Errorf("Failed to fetch embeddings, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+
+				log.Debugf("Successfully fetched embeddings for singleContent: '%s'", singleContent)
+				singleEmbeddingResult := new(EmbeddingResponse)
+				if err := json.Unmarshal(responseBody, singleEmbeddingResult); err != nil {
+					log.Errorf("Failed to unmarshal embedding result, err:%v", err)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				ctx.SetContext(CachePromptContextKey, singleContent)
+				ctx.SetContext(CacheKeyContextKey, singleEmbeddingResult.Output.Embeddings[0].Embedding)
+
+				vectorRequestBody, vectorResponseHeaders, err := generateVectorSearchRequest(&config, embeddingResult.Output.Embeddings[0].Embedding, log)
+				if err != nil {
+					log.Error(err.Error())
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				// 查询相似向量
+				err = config.vectorClient.Post(fmt.Sprintf(VectorSearchUrlTpl, config.VectorServiceCollection), vectorResponseHeaders, vectorRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					log.Debugf("[onHttpRequestBody] statusCode:%d, responseHeaders: '%s', responseBody:%s", statusCode, responseHeaders, string(responseBody))
+					if statusCode != 200 {
+						log.Errorf("[onHttpRequestBody] Failed to fetch vector search result, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+
+					fullVectorResult := new(VectorSearchResponse)
+					if err := json.Unmarshal(responseBody, fullVectorResult); err != nil {
+						log.Error(err.Error())
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+					if len(fullVectorResult.Output) < 1 {
+						log.Infof("[onHttpRequestBody] there is no vector search output from server")
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+					log.Infof("[onHttpRequestBody] vector search result: score: '%f', prompt: '%s', content: '%s'", fullVectorResult.Output[0].Score, fullVectorResult.Output[0].Fields["prompt"], fullVectorResult.Output[0].Fields["content"])
+					// 命中则计算末次问题的余弦相似度
+					if fullVectorResult.Output[0].Score < VectorFullMinCosine {
+						// 计算末次问题的余弦相似度
+						contents := strings.Split(fullVectorResult.Output[0].Fields["prompt"], "||")
+						lastContent := contents[len(contents)-1]
+						lastEmbeddingRequestBody, lastEmbeddingHeaders, err := generateEmbeddingRequest(&config, []string{lastContent}, log)
+						if err != nil {
+							proxywasm.ResumeHttpRequest()
+							return
+						}
+						err = config.embeddingClient.Post(EmbeddingUrl, lastEmbeddingHeaders, lastEmbeddingRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+							if statusCode != 200 {
+								log.Errorf("Failed to fetch embeddings, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+								proxywasm.ResumeHttpRequest()
+								return
+							}
+
+							log.Debugf("Successfully fetched embeddings for lastContent: '%s'", lastContent)
+							lastEmbeddingResult := new(EmbeddingResponse)
+							if err := json.Unmarshal(responseBody, lastEmbeddingResult); err != nil {
+								log.Errorf("Failed to unmarshal embedding result, err:%v", err)
+								proxywasm.ResumeHttpRequest()
+								return
+							}
+							distCos := distCosine(singleEmbeddingResult.Output.Embeddings[0].Embedding, lastEmbeddingResult.Output.Embeddings[0].Embedding)
+							log.Infof("singleContent '%s', lastContent '%s' distCosine: '%f'", singleContent, lastContent, distCos)
+							// 如果末次问题余弦相似度满足要求，则返回缓存的响应
+							// 否则继续请求
+							// if distCos < config.VectorSingleMinCosine {
+							if distCos < VectorFullSingleMinCosine {
+								log.Infof("[onHttpRequestBody] fullContent vector search hit")
+								// ctx.SetContext(CacheFullPromptContextKey, nil)
+								// ctx.SetContext(CacheFullKeyContextKey, nil)
+								respBody := fmt.Sprintf(config.ReturnResponseTemplate, fullVectorResult.Output[0].Fields["content"])
+								if !stream {
+									log.Debugf("[onHttpRequestBody] return response: '%s'", respBody)
+									proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(respBody), -1)
+								} else {
+									log.Debugf("[onHttpRequestBody] return response: '%s'", respBody)
+									proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(respBody), -1)
+								}
+							} else {
+								proxywasm.ResumeHttpRequest()
+								return
+							}
+						}, 10000)
+						if err != nil {
+							proxywasm.ResumeHttpRequest()
+							return
+						}
+
+					} else {
+						log.Info("[onHttpRequestBody] singleContent not hit vector cache")
+						proxywasm.ResumeHttpRequest()
+						return
+					}
+				}, 10000)
+				if err != nil {
+					log.Errorf("[onHttpRequestBody] vector search failed, err: '%s'", err)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+
+			}, 10000)
+			if err != nil {
+				log.Errorf("[onHttpRequestBody] Failed fetched embeddings for singleContent, err:%v", err)
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+
+		}, 10000)
+		if err != nil {
+			log.Errorf("[onHttpRequestBody] text emebedding failed, err: '%s'", err)
+			return types.ActionContinue
+		}
+	} else {
+		// 计算单次content的向量
+		log.Info("[onHttpRequestBody] execute single content")
+		singleEmbeddingRequestBody, singleEmbeddingHeaders, err := generateEmbeddingRequest(&config, []string{singleContent}, log)
+		if err != nil {
+			log.Errorf("[onHttpRequestBody] generate emebedding failed, err: '%s'", err)
+			return types.ActionContinue
+		}
+		err = config.embeddingClient.Post(EmbeddingUrl, singleEmbeddingHeaders, singleEmbeddingRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+			if statusCode != 200 {
+				log.Errorf("Failed to fetch embeddings, statusCode: %d, responseBody: %s", statusCode, string(responseBody))
+				proxywasm.ResumeHttpRequest()
+				return
+			} else {
+				log.Debugf("Successfully fetched embeddings for singleContent: '%s'", singleContent)
+				singleEmbeddingResult := new(EmbeddingResponse)
+				if err := json.Unmarshal(responseBody, singleEmbeddingResult); err != nil {
+					log.Errorf("Failed to unmarshal embedding result, err:%v", err)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				ctx.SetContext(CachePromptContextKey, singleContent)
+				ctx.SetContext(CacheKeyContextKey, singleEmbeddingResult.Output.Embeddings[0].Embedding)
+				singleVectorRequestBody, singleVectorResponseHeaders, err := generateVectorSearchRequest(&config, singleEmbeddingResult.Output.Embeddings[0].Embedding, log)
+				if err != nil {
+					log.Error(err.Error())
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				// 查询相似向量
+				err = config.vectorClient.Post(fmt.Sprintf(VectorSearchUrlTpl, config.VectorServiceCollection), singleVectorResponseHeaders, singleVectorRequestBody, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
+					log.Debugf("statusCode:%d, responseHeaders: '%s', responseBody:%s", statusCode, responseHeaders, string(responseBody))
+					if statusCode != 200 {
+						proxywasm.ResumeHttpRequest()
+						return
+					} else {
+						singleVectorResult := new(VectorSearchResponse)
+						if err := json.Unmarshal(responseBody, singleVectorResult); err != nil {
+							log.Error(err.Error())
+							proxywasm.ResumeHttpRequest()
+							return
+						}
+						if len(singleVectorResult.Output) < 1 {
+							log.Infof("[onHttpRequestBody] there is no vector search output from server")
+							proxywasm.ResumeHttpRequest()
+							return
+						}
+						log.Infof("[onHttpRequestBody] vector search result: score: '%f', prompt: '%s', content: '%s'", singleVectorResult.Output[0].Score, singleVectorResult.Output[0].Fields["prompt"], singleVectorResult.Output[0].Fields["content"])
+						// 命中则直接返回
+						if singleVectorResult.Output[0].Score < VectorSingleMinCosine {
+							// ctx.SetContext(CacheKeyContextKey, nil)
+							// ctx.SetContext(CachePromptContextKey, nil)
+							log.Infof("[onHttpRequestBody] vector search hit")
+							respBody := fmt.Sprintf(config.ReturnResponseTemplate, singleVectorResult.Output[0].Fields["content"])
+							if !stream {
+								log.Debugf("[onHttpRequestBody] return response: '%s'", respBody)
+								proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(respBody), -1)
+							} else {
+								log.Debugf("[onHttpRequestBody] return response: '%s'", respBody)
+								proxywasm.SendHttpResponse(200, [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(respBody), -1)
+							}
+						} else {
+							// 未命中则继续http请求
+							log.Info("[onHttpRequestBody] singleContent not hit vector cache")
+							proxywasm.ResumeHttpRequest()
+							return
+						}
+					}
+				}, 10000)
+				if err != nil {
+					log.Errorf("[onHttpRequestBody] singleContent vector search failed, err: '%s'", err)
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+			}
+		}, 10000)
+		if err != nil {
+			log.Errorf("[onHttpRequestBody] singleContent emebedding failed, err: '%s'", err)
+			return types.ActionContinue
+		}
+	}
+
+	return types.ActionPause
+}
+
+type EmbeddingInput struct {
+	Texts []string `json:"texts"`
+}
+
+type EmbeddingParams struct {
+	TextType string `json:"text_type"`
+}
+
+type EmbeddingRequest struct {
+	Model      string          `json:"model"`
+	Input      EmbeddingInput  `json:"input"`
+	Parameters EmbeddingParams `json:"parameters"`
+}
+
+type EmbeddingResponse struct {
+	Output EmbeddingOutput `json:"output"`
+}
+
+type EmbeddingOutput struct {
+	Embeddings []EmbeddingItem `json:"embeddings"`
+}
+
+type EmbeddingItem struct {
+	Embedding []float64 `json:"embedding"`
+	TextIndex int       `json:"text_index"`
+}
+
+// generateEmbeddingRequest 生成 embedding 请求
+func generateEmbeddingRequest(c *PluginConfig, input []string, log wrapper.Log) ([]byte, [][2]string, error) {
+	req := EmbeddingRequest{
+		Model: "text-embedding-v2",
+		Input: EmbeddingInput{
+			Texts: input,
+		},
+		Parameters: EmbeddingParams{
+			TextType: "query",
+		},
+	}
+	requestBody, err := json.Marshal(req)
+	if err != nil {
+		log.Errorf("Failed to marshal request data: %v", err)
+		return nil, nil, err
+	}
+
+	headers := [][2]string{
+		{"Authorization", "Bearer " + c.EmbeddingServiceKey},
+		{"Content-Type", "application/json"},
+	}
+	return requestBody, headers, nil
+}
+
+type VectorSearchRequest struct {
+	Vector        []float64 `json:"vector"`
+	TopK          int       `json:"topk"`
+	OutputFields  []string  `json:"output_fields"`
+	IncludeVector bool      `json:"include_vector"`
+}
+
+type VectorSearchResponse struct {
+	Code      int                  `json:"code"`
+	Message   string               `json:"message"`
+	RequestId string               `json:"request_id"`
+	Output    []VectorSearchOutput `json:"output"`
+}
+
+type VectorSearchOutput struct {
+	Id     string            `json:"id"`
+	Score  float64           `json:"score"`
+	Fields map[string]string `json:"fields"`
+}
+
+func generateVectorSearchRequest(c *PluginConfig, vector []float64, log wrapper.Log) ([]byte, [][2]string, error) {
+	req := VectorSearchRequest{
+		Vector:        vector,
+		TopK:          1,
+		IncludeVector: false,
+		OutputFields:  []string{"content", "prompt"},
+	}
+	requestBody, err := json.Marshal(req)
+	if err != nil {
+		log.Errorf("Failed to marshal request data: %v", err)
+		return nil, nil, err
+	}
+	headers := [][2]string{
+		{"dashvector-auth-token", c.VectorServiceKey},
+		{"Content-Type", "application/json"},
+	}
+	return requestBody, headers, nil
 }
 
 func processSSEMessage(ctx wrapper.HttpContext, config PluginConfig, sseMessage string, log wrapper.Log) string {
@@ -270,6 +899,7 @@ func processSSEMessage(ctx wrapper.HttpContext, config PluginConfig, sseMessage 
 }
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log wrapper.Log) types.Action {
+	log.Info("[onHttpResponseHeaders] in onHttpResponseHeaders")
 	contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
 	if strings.Contains(contentType, "text/event-stream") {
 		ctx.SetContext(StreamContextKey, struct{}{})
@@ -277,15 +907,23 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log wra
 	return types.ActionContinue
 }
 
-func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
+func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []byte, isLastChunk bool, log wrapper.Log) []byte {
+	log.Info("[onStreamingResponseBody] in onStreamingResponseBody")
+	log.Infof("[onStreamingResponseBody] chunk: '%s'", string(chunk))
 	if ctx.GetContext(ToolCallsContextKey) != nil {
 		// we should not cache tool call result
 		return chunk
 	}
-	keyI := ctx.GetContext(CacheKeyContextKey)
-	if keyI == nil {
+
+	allItemI := ctx.GetContext(CacheAllItemKey)
+	fullPromptI := ctx.GetContext(CacheCurrentFullPromptItemKey)
+	lastPromptI := ctx.GetContext(CacheCurrentLastPromptItemKey)
+
+	if fullPromptI == nil && lastPromptI == nil {
+		log.Info("[onStreamingResponseBody] no cache key, return")
 		return chunk
 	}
+
 	if !isLastChunk {
 		stream := ctx.GetContext(StreamContextKey)
 		if stream == nil {
@@ -320,9 +958,10 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 		}
 		return chunk
 	}
+
 	// last chunk
-	key := keyI.(string)
 	stream := ctx.GetContext(StreamContextKey)
+	log.Infof("[onStreamingResponseBody] isStream: '%v'", stream)
 	var value string
 	if stream == nil {
 		var body []byte
@@ -336,7 +975,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 
 		value = TrimQuote(bodyJson.Get(config.CacheValueFrom.ResponseBody).Raw)
 		if value == "" {
-			log.Warnf("parse value from response body failded, body:%s", body)
+			log.Warnf("[onStreamingResponseBody] parse value from response body failded, body:%s", body)
 			return chunk
 		}
 	} else {
@@ -349,7 +988,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 				lastMessage = chunk
 			}
 			if !strings.HasSuffix(string(lastMessage), "\n\n") {
-				log.Warnf("invalid lastMessage:%s", lastMessage)
+				log.Warnf("[onStreamingResponseBody] invalid lastMessage:%s", lastMessage)
 				return chunk
 			}
 			// remove the last \n\n
@@ -363,9 +1002,86 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, chunk []by
 			value = tempContentI.(string)
 		}
 	}
-	config.redisClient.Set(config.CacheKeyPrefix+key, value, nil)
-	if config.CacheTTL != 0 {
-		config.redisClient.Expire(config.CacheKeyPrefix+key, config.CacheTTL, nil)
+
+	allItem := allItemI.([]CacheItem)
+	fullPromptItem := fullPromptI.(CacheItem)
+	lastPromptItem := lastPromptI.(CacheItem)
+	fullPromptItem.Content = value
+	lastPromptItem.Content = value
+	log.Infof("[onStreamingResponseBody] allItem before length: '%d'", len(allItem))
+	allItem = append(allItem, fullPromptItem)
+	if !(fullPromptItem.FullPrompt == lastPromptItem.FullPrompt && fullPromptItem.LastPrompt == lastPromptItem.LastPrompt) {
+		allItem = append(allItem, lastPromptItem)
 	}
+	// 只保留 100
+	if len(allItem) > MaxCacheItems {
+		allItem = allItem[len(allItem)-MaxCacheItems:]
+	}
+	bytes, _ := json.Marshal(allItem)
+	log.Infof("[onStreamingResponseBody] allItem after length: '%d'", len(allItem))
+
+	config.redisClient.Set(CacheAllItemKey, string(bytes), nil)
+	if config.CacheTTL != 0 {
+		config.redisClient.Expire(CacheAllItemKey, config.CacheTTL, nil)
+	}
+
 	return chunk
+}
+
+type VectorInsertRequest struct {
+	Docs []VectorInsertDoc `json:"docs"`
+}
+
+type VectorInsertDoc struct {
+	Id     string            `json:"id"`
+	Vector []float64         `json:"vector"`
+	Fields map[string]string `json:"fields"`
+}
+
+func generateVectorInsertRequest(c *PluginConfig, vector []float64, prompt string, content string, log wrapper.Log) ([]byte, [][2]string, error) {
+	req := VectorInsertRequest{
+		Docs: []VectorInsertDoc{
+			{
+				Vector: vector,
+				Fields: map[string]string{"content": content, "prompt": prompt},
+			},
+		},
+	}
+	requestBody, err := json.Marshal(req)
+	if err != nil {
+		log.Errorf("Failed to marshal VectorInsert request data: %v", err)
+		return nil, nil, err
+	}
+	headers := [][2]string{
+		{"dashvector-auth-token", c.VectorServiceKey},
+		{"Content-Type", "application/json"},
+	}
+	return requestBody, headers, nil
+}
+
+// 计算向量的点积
+func dotProduct(a, b []float64) float64 {
+	result := 0.0
+	for i := range a {
+		result += a[i] * b[i]
+	}
+	return result
+}
+
+// 计算向量的模长
+func magnitude(v []float64) float64 {
+	sum := 0.0
+	for _, value := range v {
+		sum += value * value
+	}
+	return math.Sqrt(sum)
+}
+
+// 计算两个向量的余弦值
+func cosineSimilarity(a, b []float64) float64 {
+	return dotProduct(a, b) / (magnitude(a) * magnitude(b))
+}
+
+func distCosine(a, b []float64) float64 {
+	return 1 - cosineSimilarity(a, b)
 }
